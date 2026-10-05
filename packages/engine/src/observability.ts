@@ -3,8 +3,10 @@
 // the fact, so every state transition is both logged and recorded as an immutable
 // audit entry. Both sinks are injected; the engine never reaches for a global.
 
+import type { Money } from "@corridor/types";
+import type { CorridorState } from "./state";
+import type { LivenessState } from "@corridor/manifest";
 import type { CheckResult } from "./gate";
-import { isTerminal, type CorridorState } from "./state";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -31,7 +33,7 @@ export const consoleLogger: Logger = {
 export const silentLogger: Logger = { log() {} };
 
 /** One immutable record of a single state transition. */
-export interface AuditEntry {
+export interface AuditEntry extends LogFields {
   readonly idempotencyKey: string;
   readonly corridorId: string;
   readonly from: CorridorState;
@@ -40,24 +42,91 @@ export interface AuditEntry {
   readonly at: number;
   readonly error?: string;
   readonly routeTrust?: "attested" | "manifest";
-  /**
-   * Every pre-settle gate result, on the transition out of `verifying`
-   * (to `settling` on a pass, `failed` on a refusal), so "why did (or didn't)
-   * we pay?" is answerable after the fact. Absent on every other transition.
-   */
+  /** The anchor's SEP-38 fee, in the sell asset. Present on the `settled` entry when the quote carried one. */
+  readonly quoteFee?: Money;
+  /** Stellar network fee charged for the settlement, in stroops (Horizon `fee_charged`). */
+  readonly networkFee?: string;
+  readonly amountRefunded?: string;
+  readonly amountFee?: string;
+  /** Pre-settle gate results, recorded on the `verifying` transition. */
   readonly checks?: readonly CheckResult[];
+}
+
+/** Verification decision recorded before the engine claims an idempotency key. */
+export interface AuditDetail {
+  readonly event: "verifying";
+  readonly idempotencyKey: string;
+  readonly corridorId: string;
+  readonly at: number;
+  readonly detail: {
+    readonly liveness: LivenessState;
+    readonly effectiveCap?: string;
+  };
 }
 
 export interface AuditSink {
   record(entry: AuditEntry): Promise<void> | void;
+  recordDetail?(detail: AuditDetail): Promise<void> | void;
+}
+
+export type AlertKind = "held" | "refund_pending" | "breaker_tripped";
+
+export interface Alert {
+  readonly kind: AlertKind;
+  readonly corridorId: string;
+  readonly idempotencyKey?: string;
+  readonly stellarTxHash?: string;
+  readonly lastError?: string;
+  readonly at: number;
+}
+
+/** Notifications are best-effort: an alert sink must never control payment state. */
+export interface Alerting {
+  raise(alert: Alert): Promise<void> | void;
+}
+
+export const noopAlerting: Alerting = { raise() {} };
+
+/** Small test sink; production deployments should inject an alert transport. */
+export class InMemoryAlerting implements Alerting {
+  readonly alerts: Alert[] = [];
+  raise(alert: Alert): void {
+    this.alerts.push({ ...alert });
+  }
+}
+
+/** Webhook transport sends only operational identifiers and never payment PII. */
+export class WebhookAlerting implements Alerting {
+  constructor(
+    private readonly url: string,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.hostname !== "localhost") {
+      throw new Error("WebhookAlerting requires HTTPS (localhost is allowed for development)");
+    }
+  }
+
+  async raise(alert: Alert): Promise<void> {
+    const response = await this.fetchImpl(this.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(alert),
+    });
+    if (!response.ok) throw new Error(`alert webhook returned HTTP ${response.status}`);
+  }
 }
 
 /** In-memory audit log for tests/examples. Back this with an append-only table
  *  (or event stream) in production — never update or delete entries. */
 export class InMemoryAuditLog implements AuditSink {
   readonly entries: AuditEntry[] = [];
+  readonly details: AuditDetail[] = [];
   record(entry: AuditEntry): void {
     this.entries.push(entry);
+  }
+  recordDetail(detail: AuditDetail): void {
+    this.details.push(detail);
   }
 }
 
@@ -175,73 +244,4 @@ export class PrometheusMetrics implements Metrics {
     }
     return lines.join("\n") + "\n";
   }
-}
-
-// --- Transitions -----------------------------------------------------------
-
-export interface TransitionSinks {
-  readonly logger?: Logger;
-  readonly metrics?: Metrics;
-  readonly audit?: AuditSink;
-}
-
-export interface TransitionOptions {
-  readonly error?: string;
-  readonly routeTrust?: "attested" | "manifest";
-  /** Pre-settle gate results; pass them on the transition out of `verifying`. */
-  readonly checks?: readonly CheckResult[];
-}
-
-/**
- * Log + audit a single transition. `run` must already be at its new state.
- * When gate `checks` are given, each is also logged on its own line — info when
- * it passed, warn when it failed — and the full list lands on the audit entry.
- */
-export async function emitTransition(
-  sinks: TransitionSinks,
-  run: {
-    readonly idempotencyKey: string;
-    readonly corridorId: string;
-    readonly state: CorridorState;
-    readonly version: number;
-  },
-  from: CorridorState,
-  at: number,
-  opts: TransitionOptions = {},
-): Promise<void> {
-  const { error, routeTrust, checks } = opts;
-  const entry: AuditEntry = {
-    idempotencyKey: run.idempotencyKey,
-    corridorId: run.corridorId,
-    from,
-    to: run.state,
-    version: run.version,
-    at,
-    error,
-    ...(routeTrust && { routeTrust }),
-    ...(checks && { checks: [...checks] }),
-  };
-  const logger = sinks.logger ?? silentLogger;
-  for (const c of checks ?? []) {
-    // Only the check's own fields — `detail` is PII-free by contract (see
-    // CheckResult) and nothing about the sender or recipient is added here.
-    logger.log(c.passed ? "info" : "warn", "corridor.gate.check", {
-      idempotencyKey: run.idempotencyKey,
-      corridorId: run.corridorId,
-      check: c.name,
-      passed: c.passed,
-      ...(c.code && { code: c.code }),
-      detail: c.detail,
-      durationMs: c.durationMs,
-    });
-  }
-  // The per-check lines carry the results; keep the transition line flat.
-  const { checks: _checks, ...transition } = entry;
-  logger.log(error ? "error" : "info", "corridor.transition", transition);
-  const metrics = sinks.metrics ?? noopMetrics;
-  metrics.increment("corridor.transition", { to: run.state, corridor: run.corridorId });
-  if (isTerminal(run.state)) {
-    metrics.increment("corridor.terminal", { state: run.state, corridor: run.corridorId });
-  }
-  await sinks.audit?.record(entry);
 }
