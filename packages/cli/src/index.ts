@@ -23,7 +23,9 @@ import {
   parseResolveArgs,
   resolveHeldRun,
 } from "./runs.js";
-import { executeCanary } from "./wire.js";
+import { AccountInspector } from "@corridor/stellar";
+import { finalizeCanary } from "./proof.js";
+import { EXIT_NOT_COMPLETED, executeCanary } from "./wire.js";
 
 async function main(argv: string[]): Promise<number> {
   const [cmd] = argv;
@@ -44,6 +46,7 @@ async function main(argv: string[]): Promise<number> {
     let amount: string | undefined;
     let network: string | undefined;
     let skipDoctor = false;
+    let write = false;
 
     const rest = argv.slice(1);
     for (let i = 0; i < rest.length; i++) {
@@ -66,6 +69,8 @@ async function main(argv: string[]): Promise<number> {
         network = arg.slice("--network=".length);
       } else if (arg === "--skip-doctor") {
         skipDoctor = true;
+      } else if (arg === "--write") {
+        write = true;
       } else if (arg.startsWith("--")) {
         console.error(`error: unknown option "${arg}"`);
         return 2;
@@ -81,7 +86,7 @@ async function main(argv: string[]): Promise<number> {
 
     if (!file) {
       console.error(
-        "usage: corridor canary <file.corridor.yaml> --amount <amount> [--network <public|testnet>]",
+        "usage: corridor canary <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--write]",
       );
       return 2;
     }
@@ -112,7 +117,30 @@ async function main(argv: string[]): Promise<number> {
       network,
       skipDoctor,
     });
-    return runResult.exitCode;
+    if (runResult.exitCode !== 0 || !runResult.run || !runResult.settlement) {
+      return runResult.exitCode;
+    }
+
+    // Re-read the settlement from Horizon and print the proof block it earned;
+    // with --write also record it in the manifest (comments preserved). A run
+    // that did not complete returned above, so the file stays byte-identical.
+    const finalized = await finalizeCanary({
+      result: runResult.run,
+      settlement: runResult.settlement,
+      corridor: loaded.value,
+      verifier: new AccountInspector({ horizonUrl: runResult.horizonUrl }),
+      manifestPath: file,
+      write,
+    });
+    if (!finalized.ok) {
+      console.error(
+        `✗ canary proof rejected: ${finalized.error.code} — ${finalized.error.message}`,
+      );
+      return EXIT_NOT_COMPLETED;
+    }
+    console.log(`\nproof (chain-verified):\n${finalized.value.yaml}`);
+    if (finalized.value.written) console.log(`wrote proof to ${file}`);
+    return 0;
   }
 
   const file = argv[1];

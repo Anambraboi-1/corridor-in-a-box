@@ -24,6 +24,8 @@ import {
   execute,
   type EngineDeps,
   type GateCheck,
+  type RunResult,
+  type SettlementRequest,
 } from "@corridor/engine";
 import { compareAmounts, type Outcome, type PaymentIntent } from "@corridor/types";
 import deploymentsData from "../../../contracts/deployments.json";
@@ -373,6 +375,10 @@ export interface CanaryRunResult {
   transactionId?: string;
   stellarTxHash?: string;
   error?: string;
+  /** Terminal run result and the settlement the submitter was asked to make; set on a completed run. */
+  run?: RunResult;
+  settlement?: SettlementRequest;
+  horizonUrl?: string;
 }
 
 /**
@@ -460,7 +466,21 @@ export async function executeCanary(
 
   // 6. Wire real stack
   const wired = wireCorridorDeps(corridor, { signerSecret: secret });
-  const { deps, signer, adapter, store, audit, horizonUrl } = wired;
+  const { signer, adapter, store, audit, horizonUrl } = wired;
+
+  // Capture the settlement request the engine submits, so `--write` can
+  // re-verify exactly that payment on chain before recording a proof.
+  let settlement: SettlementRequest | undefined;
+  const deps: EngineDeps = {
+    ...wired.deps,
+    submitter: {
+      submit: async (request) => {
+        settlement = request;
+        return wired.deps.submitter.submit(request);
+      },
+      refund: (request) => wired.deps.submitter.refund(request),
+    },
+  };
 
   // 7. SEP-12 customer identification
   let senderSep12Id = process.env.SENDER_SEP12_ID;
@@ -590,5 +610,8 @@ export async function executeCanary(
     trail,
     transactionId: txId,
     stellarTxHash: stellarTx,
+    run: result.value,
+    settlement,
+    horizonUrl,
   };
 }
