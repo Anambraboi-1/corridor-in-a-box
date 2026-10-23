@@ -225,88 +225,158 @@ export class InMemoryMetrics implements Metrics {
 }
 
 // --- Prometheus exposition ----------------------------------------------
-// A zero-dependency Metrics sink that aggregates in process and renders the
-// Prometheus text exposition format. Counters sum; timings become a summary-
-// style `<name>_count` + `<name>_sum_ms`. Serve render() from a /metrics
-// endpoint (see @corridor/service) and point a scraper at it — no client lib.
-//
-// The engine already emits `corridor.terminal{state=…}` on every terminal
-// transition, so alerting on stuck money is a query away, e.g.:
-//   increase(corridor_terminal{state="held"}[15m]) > 0
-//   increase(corridor_terminal{state="failed"}[15m]) > 0
+// Zero-dependency Prometheus text exposition. Timing samples are histograms
+// in seconds.
 
-/** Prometheus metric/label names allow [a-zA-Z0-9_]; map anything else to "_". */
 function sanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
-/** Escape a label value per the exposition format (backslash, quote, newline). */
-function escapeLabel(v: string): string {
-  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+function escapeLabel(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
+
+function escapeHelp(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
 }
 
 function renderLabels(tags?: MetricTags): string {
   const keys = tags ? Object.keys(tags).sort() : [];
-  if (keys.length === 0) return "";
-  return `{${keys.map((k) => `${sanitize(k)}="${escapeLabel(tags![k])}"`).join(",")}}`;
+  return keys.length
+    ? `{${keys.map((key) => `${sanitize(key)}="${escapeLabel(tags![key])}"`).join(",")}}`
+    : "";
 }
 
-/** Stable key for a (name, tags) series so samples aggregate correctly. */
 function seriesKey(name: string, tags?: MetricTags): string {
   return name + renderLabels(tags);
 }
 
+export interface PrometheusMetricsOptions {
+  /** Inclusive upper bounds in seconds. Must be finite, positive and increasing. */
+  readonly buckets?: readonly number[];
+}
+
+interface CounterSeries {
+  name: string;
+  labels: string;
+  value: number;
+}
+
+interface HistogramSeries {
+  name: string;
+  helpKey: string;
+  labels: string;
+  count: number;
+  sumSeconds: number;
+  bucketCounts: number[];
+}
+
+const DEFAULT_HISTOGRAM_BUCKETS_SECONDS = [
+  0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+] as const;
+
 export class PrometheusMetrics implements Metrics {
-  private readonly counters = new Map<
-    string,
-    { name: string; labels: string; value: number }
-  >();
-  private readonly timings = new Map<
-    string,
-    { name: string; labels: string; count: number; sumMs: number }
-  >();
+  private readonly counters = new Map<string, CounterSeries>();
+  private readonly timings = new Map<string, HistogramSeries>();
+  private readonly help = new Map<string, string>();
+  private readonly buckets: readonly number[];
+
+  constructor(options: PrometheusMetricsOptions = {}) {
+    const buckets = [...(options.buckets ?? DEFAULT_HISTOGRAM_BUCKETS_SECONDS)];
+    if (
+      buckets.some((bucket) => !Number.isFinite(bucket) || bucket <= 0) ||
+      buckets.some((bucket, index) => index > 0 && bucket <= buckets[index - 1])
+    ) {
+      throw new RangeError(
+        "Prometheus histogram buckets must be finite, positive, and strictly increasing",
+      );
+    }
+    this.buckets = buckets;
+  }
+
+  /** Register HELP text for a counter or timing metric. */
+  registerHelp(name: string, help: string): void {
+    const metricName = sanitize(name);
+    if (!metricName || !help.trim()) {
+      throw new Error("Prometheus metric name and HELP text must be non-empty");
+    }
+    this.help.set(metricName, help);
+  }
 
   increment(name: string, tags?: MetricTags): void {
     const key = seriesKey(name, tags);
     const existing = this.counters.get(key);
     if (existing) existing.value += 1;
-    else
-      this.counters.set(key, { name: sanitize(name), labels: renderLabels(tags), value: 1 });
-  }
-
-  timing(name: string, ms: number, tags?: MetricTags): void {
-    const key = seriesKey(name, tags);
-    const existing = this.timings.get(key);
-    if (existing) {
-      existing.count += 1;
-      existing.sumMs += ms;
-    } else {
-      this.timings.set(key, {
+    else {
+      this.counters.set(key, {
         name: sanitize(name),
         labels: renderLabels(tags),
-        count: 1,
-        sumMs: ms,
+        value: 1,
       });
     }
   }
 
-  /** Render all series in Prometheus text exposition format. */
+  timing(name: string, ms: number, tags?: MetricTags): void {
+    if (!Number.isFinite(ms) || ms < 0) {
+      throw new RangeError("Prometheus timing samples must be finite and non-negative");
+    }
+    const key = seriesKey(name, tags);
+    const seconds = ms / 1000;
+    const existing = this.timings.get(key);
+    if (existing) {
+      existing.count += 1;
+      existing.sumSeconds += seconds;
+      existing.bucketCounts = existing.bucketCounts.map(
+        (count, index) => count + (seconds <= this.buckets[index] ? 1 : 0),
+      );
+    } else {
+      this.timings.set(key, {
+        name: `${sanitize(name)}_seconds`,
+        helpKey: sanitize(name),
+        labels: renderLabels(tags),
+        count: 1,
+        sumSeconds: seconds,
+        bucketCounts: this.buckets.map((bucket) => (seconds <= bucket ? 1 : 0)),
+      });
+    }
+  }
+
   render(): string {
     const lines: string[] = [];
-    const counterNames = new Set([...this.counters.values()].map((c) => c.name));
+    const counterNames = new Set([...this.counters.values()].map((counter) => counter.name));
     for (const name of [...counterNames].sort()) {
+      lines.push(
+        `# HELP ${name} ${escapeHelp(this.help.get(name) ?? `Counter metric ${name}.`)}`,
+      );
       lines.push(`# TYPE ${name} counter`);
-      for (const c of this.counters.values()) {
-        if (c.name === name) lines.push(`${c.name}${c.labels} ${c.value}`);
+      for (const counter of this.counters.values()) {
+        if (counter.name === name) {
+          lines.push(`${counter.name}${counter.labels} ${counter.value}`);
+        }
       }
     }
-    const timingNames = new Set([...this.timings.values()].map((t) => t.name));
+
+    const timingNames = new Set([...this.timings.values()].map((timing) => timing.name));
     for (const name of [...timingNames].sort()) {
-      lines.push(`# TYPE ${name}_ms summary`);
-      for (const t of this.timings.values()) {
-        if (t.name !== name) continue;
-        lines.push(`${t.name}_ms_count${t.labels} ${t.count}`);
-        lines.push(`${t.name}_ms_sum${t.labels} ${t.sumMs}`);
+      const series = [...this.timings.values()].filter((timing) => timing.name === name);
+      const helpKey = series[0].helpKey;
+      const helpText =
+        this.help.get(helpKey) ?? `Duration of ${helpKey} operations in seconds.`;
+      lines.push(`# HELP ${name} ${escapeHelp(helpText)}`);
+      lines.push(`# TYPE ${name} histogram`);
+      for (const timing of series) {
+        this.buckets.forEach((bucket, index) => {
+          const labels = timing.labels
+            ? `${timing.labels.slice(0, -1)},le="${bucket}"}`
+            : `{le="${bucket}"}`;
+          lines.push(`${name}_bucket${labels} ${timing.bucketCounts[index]}`);
+        });
+        const infLabels = timing.labels
+          ? `${timing.labels.slice(0, -1)},le="+Inf"}`
+          : `{le="+Inf"}`;
+        lines.push(`${name}_bucket${infLabels} ${timing.count}`);
+        lines.push(`${name}_sum${timing.labels} ${timing.sumSeconds}`);
+        lines.push(`${name}_count${timing.labels} ${timing.count}`);
       }
     }
     return lines.join("\n") + "\n";

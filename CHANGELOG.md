@@ -7,6 +7,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Fixed — Prometheus exposition conformance (#274)
+
+- Added HELP metadata to emitted metric families and changed timing metrics from
+  incomplete millisecond summaries to parser-compatible histograms measured in
+  seconds, with configurable cumulative buckets.
+- **Breaking metrics change:** timing families now use
+  `<name>_seconds_bucket`, `<name>_seconds_sum`, and
+  `<name>_seconds_count` instead of the previous `<name>_ms_count` and
+  `<name>_ms_sum` samples. Update dashboards and alert rules accordingly.
+- Added parser-based regression coverage for family types, HELP text, histogram
+  buckets, aggregation, and escaped labels.
+
 ### Added — `PostgresAuditSink`: a durable, append-only audit trail ([#272](https://github.com/ezedike-evan/corridor-in-a-box/issues/272))
 
 The audit trail used to live only in memory, so the service lost it on every
