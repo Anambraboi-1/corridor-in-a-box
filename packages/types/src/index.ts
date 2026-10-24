@@ -116,7 +116,7 @@ export interface Money {
 
 // --- Parties & intent ----------------------------------------------------
 
-/** Opaque reference to a party. Real PII lives behind the anchor's SEP-12, never here. */
+/** Opaque reference to a party. Real PII lives behind the anchor's KYC system, never here. */
 export interface PartyRef {
   /** OUR internal reference for this party. Meaningless to the anchor. */
   readonly id: string;
@@ -129,9 +129,27 @@ export interface PartyRef {
    * ours and means nothing to them, and the operator's own SEP-10 account
    * identifies the OPERATOR, not the customer — checking KYC against it answers
    * a question nobody asked. A corridor whose dest exposes a `kyc_server`
-   * requires this to be set; the engine fails closed without it.
+   * requires a customer reference; the engine fails closed without it.
+   *
+   * @deprecated Use `anchorCustomerId`. Still read as an alias; when both are
+   * set, `anchorCustomerId` wins (see `anchorCustomerIdOf`).
    */
   readonly sep12Id?: string;
+  /**
+   * The receiving anchor's own reference for this party, whatever issued it: a
+   * SEP-12 customer id, a SEP-6 `customer_id`, or a bespoke anchor's onboarding
+   * id. Protocol-neutral successor to `sep12Id`. An opaque id, never PII.
+   */
+  readonly anchorCustomerId?: string;
+}
+
+/**
+ * The anchor customer reference for a party: `anchorCustomerId` when set,
+ * falling back to the deprecated `sep12Id` alias. An empty string counts as
+ * unset, so the caller's fail-closed check sees "no reference", not "".
+ */
+export function anchorCustomerIdOf(party: PartyRef): string | undefined {
+  return party.anchorCustomerId || party.sep12Id || undefined;
 }
 
 export interface PaymentIntent {
