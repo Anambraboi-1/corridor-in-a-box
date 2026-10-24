@@ -4,7 +4,7 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
-import { StaticRouteResolver } from "@corridor/router";
+import { StaticRouteResolver, UnattestedAnchorError } from "@corridor/router";
 import {
   InMemoryAuditLog,
   InMemoryIdempotencyStore,
@@ -306,6 +306,32 @@ describe("service: strict payment body validation", () => {
     });
     expect(r.status).toBe(200);
     expect((r.body as { state: string }).state).toBe("completed");
+  });
+});
+
+describe("service: refused route", () => {
+  it("answers 503 ROUTE_REFUSED and records the run as failed", async () => {
+    const s = svc({
+      deps: {
+        ...deps(),
+        resolver: {
+          async resolve() {
+            throw new UnattestedAnchorError("d.example", "no attestation on file");
+          },
+        },
+      },
+    });
+    const r = await s.route({
+      method: "POST",
+      path: "/payments",
+      body: intentBody("refused"),
+    });
+    expect(r.status).toBe(503);
+    expect((r.body as { error: string }).error).toBe("ROUTE_REFUSED");
+
+    const run = await s.route({ method: "GET", path: "/payments/refused" });
+    expect(run.status).toBe(200);
+    expect((run.body as { state: string }).state).toBe("failed");
   });
 });
 

@@ -228,6 +228,10 @@ const STATUS_BY_CODE: Record<CorridorErrorCode, number> = {
   // The HTTP API never starts a dry run, so this only keeps the table total.
   // 409, not 2xx: no payment was made, and the key is spent.
   DRY_RUN_COMPLETE: 409,
+  // The resolver would not route the payment (e.g. an unattested anchor). 503,
+  // like CORRIDOR_HALTED: a well-formed request refused because no trusted
+  // route is available, not a fault in the caller's input or in this server.
+  ROUTE_REFUSED: 503,
 };
 
 /** Token-bucket rate limiter, keyed per client. In-memory; swap for Redis at scale. */

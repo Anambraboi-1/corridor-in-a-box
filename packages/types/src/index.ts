@@ -63,7 +63,13 @@ export type CorridorErrorCode =
    * settle payment. The run is persisted as `failed` so its key cannot later
    * be reused to move money.
    */
-  | "DRY_RUN_COMPLETE";
+  | "DRY_RUN_COMPLETE"
+  /**
+   * The route resolver refused (threw) instead of choosing a receiving anchor,
+   * e.g. an unattested anchor. Fail closed: nothing was sent, a fresh run is
+   * persisted as `failed`, and the key is spent. Not retryable.
+   */
+  | "ROUTE_REFUSED";
 
 /**
  * Returns true if the error code is a pre-settle gate check refusal.
